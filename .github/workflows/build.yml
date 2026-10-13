@@ -1,0 +1,38 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch: # Permite compilar manualmente con un botón
+  push:
+    branches:
+      - main # También compilará automáticamente si subes cambios a 'main'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Configurar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Configurar Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Descargar dependencias
+        run: flutter pub get
+
+      - name: Construir el APK
+        run: flutter build apk --release
+
+      - name: Guardar el APK como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
