@@ -1,10 +1,10 @@
 name: Build Android APK
 
 on:
-  workflow_dispatch: # Permite compilar manualmente con un botón
+  workflow_dispatch:
   push:
     branches:
-      - main # También compilará automáticamente si subes cambios a 'main'
+      - main
 
 jobs:
   build:
@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Configurar Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'zulu'
           java-version: '17'
