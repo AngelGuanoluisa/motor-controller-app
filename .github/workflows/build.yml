@@ -26,13 +26,15 @@ jobs:
           channel: 'stable'
 
       - name: Descargar dependencias
+        working-directory: ./nombre_de_tu_carpeta
         run: flutter pub get
 
       - name: Construir el APK
+        working-directory: ./nombre_de_tu_carpeta
         run: flutter build apk --release
 
       - name: Guardar el APK como artefacto
         uses: actions/upload-artifact@v4
         with:
           name: app-release-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          path: ./nombre_de_tu_carpeta/build/app/outputs/flutter-apk/app-release.apk
