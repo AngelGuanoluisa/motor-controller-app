@@ -63,6 +63,70 @@ Cada push a `main`/`master` compila el APK en GitHub Actions:
 
 ---
 
+## 🔋 Medición de corriente (prueba adicional)
+
+El BTS7960 tiene pines de sensado **R_IS** y **L_IS** que entregan una corriente
+proporcional a la del motor (`I_IS = I_motor / 8500`). Con una resistencia a GND
+esa corriente se convierte en tensión, que la ESP32 lee con su ADC.
+
+### Conexión
+
+| Pin BTS7960 | Conexión |
+| :--- | :--- |
+| **R_IS** | Resistencia **680 Ω** a GND, y de ahí a **GPIO 34** (opcional: 1 kΩ en serie hacia el GPIO) |
+| **L_IS** | Resistencia **680 Ω** a GND, y de ahí a **GPIO 35** (opcional: 1 kΩ en serie hacia el GPIO) |
+
+```text
+ R_IS ──┬──[1k opcional]── GPIO 34        L_IS ──┬──[1k opcional]── GPIO 35
+        │                                        │
+      [680Ω]                                   [680Ω]
+        │                                        │
+       GND                                      GND
+```
+
+> ⚠️ **No uses 1 kΩ o más a GND**: ante un fallo el BTS7960 saca ~4.5 mA por IS
+> y con 1 kΩ serían 4.5 V, suficiente para dañar el pin de la ESP32. Con 680 Ω
+> el máximo es ~3.06 V. Si usas otro valor, configúralo con `SET_RIS:<ohm>`.
+> Si tu módulo ya trae resistencia en IS, mídela con el multímetro (sin
+> alimentar) y tenla en cuenta: dos resistencias quedan en paralelo.
+
+### Primer uso (por Monitor Serie o BLE)
+
+1. Con el motor **detenido**, envía `CAL_I0` para calibrar el cero.
+2. Arranca el motor (`START`, `SPD:200`). Cada segundo verás:
+   `[CORRIENTE MEDIDA] Promedio: 1.85 A | Pico: 2.40 A | Consumido: 0.3 mAh | PWM: 200`
+3. Compara con un multímetro/pinza en serie con la fuente. Si hay diferencia
+   constante, ajusta el factor con `SET_KILIS:<valor>` (más alto = lee más corriente).
+   Ej.: lee 1.85 A y el multímetro marca 2.00 A → `SET_KILIS:9189` (8500 × 2.00 / 1.85).
+
+### Sin sensor: modo estimado
+
+Si no conectas R_IS/L_IS, usa `CUR_MODE:EST`. La corriente se estima como
+`I_nominal × PWM/255`. Mide una vez con el multímetro la corriente a PWM 255
+con la carga habitual y guárdala con `SET_INOM:<mA>` (ej. `SET_INOM:2500`).
+Es solo una aproximación: no detecta atascos ni cambios de carga.
+
+### Comandos de corriente
+
+| Comando | Función |
+| :--- | :--- |
+| `CUR` | Muestra la corriente actual |
+| `CUR_RESET` | Reinicia el pico y los mAh acumulados |
+| `CAL_I0` | Calibra el cero (con el motor detenido) |
+| `CUR_MODE:SENSOR` / `CUR_MODE:EST` | Medición real por IS / estimación por PWM |
+| `SET_RIS:<ohm>` | Resistencia de IS a GND (por defecto 680) |
+| `SET_KILIS:<k>` | Factor de sensado del BTS7960 (por defecto 8500) |
+| `SET_INOM:<mA>` | Corriente a PWM 255 para el modo estimado |
+| `SET_ILIM:<mA>` | Paro de emergencia automático si se supera durante 300 ms (0 = desactivado) |
+| `CUR_LOG:1` / `CUR_LOG:0` | Activa/desactiva el registro cada segundo en el Monitor Serie |
+
+Todos los valores se guardan en la memoria flash. Por BLE la ESP32 envía cada
+250 ms `CUR:<mA promedio>,<mA pico>,<mAh>,<S|E>` y, si actúa la protección,
+`ALERT:OVERCURRENT`. La app actual ignora estos mensajes, así que sigue
+funcionando igual.
+
+---
+
 ## 📱 Paso 2: Compilar la App localmente (opcional)
 
 Requisitos: Flutter 3.47 o superior, Android SDK y JDK 17.
