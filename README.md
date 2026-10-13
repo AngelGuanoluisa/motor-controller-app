@@ -106,12 +106,31 @@ Si no conectas R_IS/L_IS, usa `CUR_MODE:EST`. La corriente se estima como
 con la carga habitual y guárdala con `SET_INOM:<mA>` (ej. `SET_INOM:2500`).
 Es solo una aproximación: no detecta atascos ni cambios de carga.
 
+### 🔒 Límite de consumo (750 mAh) con bloqueo
+
+La ESP32 acumula la carga consumida (mAh). Cuando llega al límite
+(**750 mAh** por defecto):
+
+1. Activa el **paro de emergencia** y el motor queda **bloqueado**.
+2. `RESET_E` **no** lo libera, ni siquiera tras reiniciar o apagar la ESP32
+   (el consumo y el bloqueo se guardan en flash).
+3. Para desbloquear: `CUR_RESET` (pone el contador a cero) y luego `RESET_E`.
+   En la app basta con el botón **"Reiniciar contador y desbloquear"**.
+
+> **mAh ≠ mA.** 750 mAh es carga acumulada: p. ej. 750 mA durante 1 hora,
+> 1.5 A durante 30 min o 3 A durante 15 min. Para cortar por corriente
+> instantánea usa `SET_ILIM:<mA>`.
+
+El límite se cambia con `SET_MAH_LIM:<mAh>` (0 = sin límite) o desde los
+ajustes ⚙️ de la app.
+
 ### Comandos de corriente
 
 | Comando | Función |
 | :--- | :--- |
 | `CUR` | Muestra la corriente actual |
-| `CUR_RESET` | Reinicia el pico y los mAh acumulados |
+| `CUR_RESET` | Reinicia el pico y los mAh acumulados, y libera el bloqueo por consumo |
+| `SET_MAH_LIM:<mAh>` | Límite de consumo acumulado (por defecto 750, 0 = sin límite) |
 | `CAL_I0` | Calibra el cero (con el motor detenido) |
 | `CUR_MODE:SENSOR` / `CUR_MODE:EST` | Medición real por IS / estimación por PWM |
 | `SET_RIS:<ohm>` | Resistencia de IS a GND (por defecto 680) |
@@ -121,9 +140,16 @@ Es solo una aproximación: no detecta atascos ni cambios de carga.
 | `CUR_LOG:1` / `CUR_LOG:0` | Activa/desactiva el registro cada segundo en el Monitor Serie |
 
 Todos los valores se guardan en la memoria flash. Por BLE la ESP32 envía cada
-250 ms `CUR:<mA promedio>,<mA pico>,<mAh>,<S|E>` y, si actúa la protección,
-`ALERT:OVERCURRENT`. La app actual ignora estos mensajes, así que sigue
-funcionando igual.
+250 ms `CUR:<mA promedio>,<mA pico>,<mAh>,<S|E>,<límite mAh>,<bloqueado 0|1>`
+y, si actúa una protección, `ALERT:OVERCURRENT`, `ALERT:MAH_LIMIT` o
+`ALERT:LOCKED`.
+
+### 📈 En la app
+
+La tarjeta **Consumo de Corriente** muestra la corriente actual y el pico, una
+barra del consumo acumulado frente al límite (verde → naranja al 80 % → rojo)
+y una **gráfica de la corriente de los últimos 60 s**. Si se alcanza el límite,
+aparece un aviso y el botón para desbloquear.
 
 ---
 

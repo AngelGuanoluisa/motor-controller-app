@@ -1,8 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+
+import 'consumo_card.dart';
 
 void main() {
   runApp(const MotorControllerApp());
@@ -54,6 +58,17 @@ class _MotorDashboardState extends State<MotorDashboard> {
   bool isCw = true;
   bool isRunning = false;
   bool isEmergency = false;
+
+  // Consumo de corriente (mensajes CUR: de la ESP32)
+  double corrienteMa = 0;
+  double picoMa = 0;
+  double consumoMah = 0;
+  int limiteMah = 750;
+  bool corrienteEstimada = false;
+  bool bloqueoConsumo = false;
+  bool hayDatosCorriente = false;
+  final List<FlSpot> historialCorriente = [];
+  final Stopwatch relojGrafica = Stopwatch();
 
   // Parámetros de Configuración del Motor
   int currentFreq = 20000;
@@ -161,31 +176,82 @@ class _MotorDashboardState extends State<MotorDashboard> {
   }
 
   Future<void> descubrirServicios(BluetoothDevice device) async {
-    List<BluetoothService> services = await device.discoverServices();
-    for (var s in services) {
-      if (s.uuid.toString().toLowerCase() == serviceUuid) {
-        for (var c in s.characteristics) {
-          if (c.uuid.toString().toLowerCase() == rxUuid) {
-            rxCharacteristic = c;
-          }
-          if (c.uuid.toString().toLowerCase() == txUuid) {
-            txCharacteristic = c;
-            await txSubscription?.cancel();
-            txSubscription = c.onValueReceived.listen((data) {
-              procesarBytesEntrantes(data);
-            });
-            device.cancelWhenDisconnected(txSubscription!);
-            await c.setNotifyValue(true);
-          }
+    final servicioUart = Guid(serviceUuid);
+    final caracRx = Guid(rxUuid);
+    final caracTx = Guid(txUuid);
+
+    // Android guarda en caché los servicios BLE de cada dispositivo. Si la ESP32
+    // tuvo antes otro firmware, el teléfono puede seguir viendo los servicios
+    // viejos; por eso se limpia la caché y se reintenta.
+    List<BluetoothService> services = [];
+    for (int intento = 1; intento <= 3; intento++) {
+      if (Platform.isAndroid) {
+        try {
+          await device.clearGattCache();
+        } catch (_) {}
+      }
+      services = await device.discoverServices();
+      if (services.any((s) => s.uuid == servicioUart)) break;
+      await Future.delayed(const Duration(milliseconds: 600));
+    }
+
+    for (var s in services.where((s) => s.uuid == servicioUart)) {
+      for (var c in s.characteristics) {
+        if (c.uuid == caracRx) {
+          rxCharacteristic = c;
+        }
+        if (c.uuid == caracTx) {
+          txCharacteristic = c;
+          await txSubscription?.cancel();
+          txSubscription = c.onValueReceived.listen((data) {
+            procesarBytesEntrantes(data);
+          });
+          device.cancelWhenDisconnected(txSubscription!);
+          await c.setNotifyValue(true);
         }
       }
     }
     if (rxCharacteristic == null) {
-      mostrarMensaje('La ESP32 no expone el servicio UART BLE esperado');
+      mostrarDiagnosticoServicios(services);
       return;
     }
     // Solicitar configuración actual
     Future.delayed(const Duration(milliseconds: 300), () => enviarComando("GET_CFG"));
+  }
+
+  void mostrarDiagnosticoServicios(List<BluetoothService> services) {
+    if (!mounted) return;
+    final lista = services.isEmpty
+        ? '(ningún servicio)'
+        : services
+            .map((s) => '• ${s.uuid.str128}\n'
+                '${s.characteristics.map((c) => '    - ${c.uuid.str128}').join('\n')}')
+            .join('\n');
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Servicio BLE no encontrado'),
+        content: SingleChildScrollView(
+          child: Text(
+            'La app busca el servicio:\n$serviceUuid\n\n'
+            'El dispositivo "${targetDevice?.platformName}" ofrece:\n$lista\n\n'
+            'Posibles causas:\n'
+            '1. La ESP32 no tiene cargado el firmware de este proyecto.\n'
+            '2. El teléfono recuerda los servicios de un firmware anterior: '
+            'desactiva y activa el Bluetooth del teléfono, o reinicia el teléfono.',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              targetDevice?.disconnect();
+            },
+            child: const Text('Desconectar'),
+          ),
+        ],
+      ),
+    );
   }
 
   // La ESP32 envía cada mensaje en una notificación (sin '\n'). Al conectar,
@@ -225,6 +291,97 @@ class _MotorDashboardState extends State<MotorDashboard> {
         });
       }
     }
+    // 3. Corriente: CUR:<mA>,<mA pico>,<mAh>,<S|E>[,<límite mAh>,<bloqueado 0|1>]
+    else if (raw.startsWith("CUR:")) {
+      var c = raw.substring(4).split(",");
+      if (c.length >= 4) {
+        if (!relojGrafica.isRunning) relojGrafica.start();
+        final t = relojGrafica.elapsedMilliseconds / 1000.0;
+        setState(() {
+          hayDatosCorriente = true;
+          corrienteMa = double.tryParse(c[0]) ?? corrienteMa;
+          picoMa = double.tryParse(c[1]) ?? picoMa;
+          consumoMah = double.tryParse(c[2]) ?? consumoMah;
+          corrienteEstimada = c[3] == "E";
+          if (c.length >= 6) {
+            limiteMah = int.tryParse(c[4]) ?? limiteMah;
+            bloqueoConsumo = c[5] == "1";
+          }
+          historialCorriente.add(FlSpot(t, corrienteMa / 1000.0));
+          // Conservar solo la ventana visible de la gráfica
+          while (historialCorriente.isNotEmpty && historialCorriente.first.x < t - ventanaGraficaSeg - 1) {
+            historialCorriente.removeAt(0);
+          }
+        });
+      }
+    }
+    // 4. Alertas de protección
+    else if (raw.startsWith("ALERT:")) {
+      final tipo = raw.substring(6);
+      if (tipo == "MAH_LIMIT") {
+        setState(() => bloqueoConsumo = true);
+        mostrarAlertaBloqueo();
+      } else if (tipo == "OVERCURRENT") {
+        mostrarMensaje('⚠️ Paro por SOBRECORRIENTE');
+      } else if (tipo == "LOCKED") {
+        mostrarMensaje('Motor bloqueado por consumo: reinicia el contador para desbloquear');
+      }
+    }
+  }
+
+  void mostrarAlertaBloqueo() {
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        icon: const Icon(Icons.lock, color: Colors.redAccent, size: 40),
+        title: const Text('Límite de consumo alcanzado'),
+        content: Text(
+          'Se consumieron ${consumoMah.toStringAsFixed(1)} mAh '
+          '(límite $limiteMah mAh).\n\n'
+          'Se activó el paro de emergencia y el motor quedó bloqueado.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Entendido')),
+        ],
+      ),
+    );
+  }
+
+  Future<void> confirmarDesbloqueo() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('¿Desbloquear el motor?'),
+        content: const Text(
+          'Se pondrá a cero el contador de consumo (mAh) y se restablecerá '
+          'el paro de emergencia. El motor no arrancará hasta que pulses MARCHA.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancelar')),
+          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Desbloquear')),
+        ],
+      ),
+    );
+    if (ok == true) {
+      await enviarComando('CUR_RESET');
+      await enviarComando('RESET_E');
+    }
+  }
+
+  Future<void> confirmarReinicioContador() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('¿Reiniciar el contador?'),
+        content: const Text('El consumo acumulado (mAh) y el pico de corriente volverán a cero.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancelar')),
+          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Reiniciar')),
+        ],
+      ),
+    );
+    if (ok == true) await enviarComando('CUR_RESET');
   }
 
   Future<void> enviarComando(String comando) async {
@@ -242,6 +399,7 @@ class _MotorDashboardState extends State<MotorDashboard> {
     final minSpdCtrl = TextEditingController(text: currentMinSpeed.toString());
     final maxSpdCtrl = TextEditingController(text: currentMaxSpeed.toString());
     final rampCtrl = TextEditingController(text: currentRampMs.toString());
+    final mahLimCtrl = TextEditingController(text: limiteMah.toString());
     bool tempInvert = isInverted;
 
     showModalBottomSheet(
@@ -347,6 +505,20 @@ class _MotorDashboardState extends State<MotorDashboard> {
                       },
                     ),
 
+                    const SizedBox(height: 12),
+
+                    // Límite de consumo acumulado
+                    TextField(
+                      controller: mahLimCtrl,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                        labelText: 'Límite de consumo (mAh)',
+                        helperText: 'Al alcanzarlo se bloquea el motor (0 = sin límite)',
+                        border: OutlineInputBorder(),
+                        prefixIcon: Icon(Icons.battery_alert),
+                      ),
+                    ),
+
                     const SizedBox(height: 20),
 
                     // Botón Guardar
@@ -370,6 +542,8 @@ class _MotorDashboardState extends State<MotorDashboard> {
                           if (sMin != null && sMax != null) enviarComando('SET_LIMITS:$sMin,$sMax');
                           if (r != null) enviarComando('SET_RAMP:$r');
                           enviarComando('SET_INVERT:${tempInvert ? 1 : 0}');
+                          int? mahLim = int.tryParse(mahLimCtrl.text);
+                          if (mahLim != null && mahLim >= 0) enviarComando('SET_MAH_LIM:$mahLim');
 
                           Navigator.pop(context);
                           ScaffoldMessenger.of(context).showSnackBar(
@@ -455,7 +629,7 @@ class _MotorDashboardState extends State<MotorDashboard> {
                 onPressed: () => enviarComando('E'),
               ),
             ),
-            if (isEmergency)
+            if (isEmergency && !bloqueoConsumo)
               Padding(
                 padding: const EdgeInsets.only(top: 8.0),
                 child: TextButton.icon(
@@ -553,8 +727,10 @@ class _MotorDashboardState extends State<MotorDashboard> {
                 padding: const EdgeInsets.all(16.0),
                 child: Column(
                   children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    Wrap(
+                      alignment: WrapAlignment.spaceBetween,
+                      spacing: 8,
+                      runSpacing: 4,
                       children: [
                         const Text('Velocidad PWM', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                         Text('${speedValue.round()} (${((speedValue / 255.0) * 100).toStringAsFixed(0)}%) [Real: ${realSpeedValue.round()}]',
@@ -582,6 +758,30 @@ class _MotorDashboardState extends State<MotorDashboard> {
                 ),
               ),
             ),
+
+            const SizedBox(height: 16),
+
+            // CONSUMO DE CORRIENTE
+            if (hayDatosCorriente)
+              ConsumoCard(
+                corrienteMa: corrienteMa,
+                picoMa: picoMa,
+                consumoMah: consumoMah,
+                limiteMah: limiteMah,
+                esEstimada: corrienteEstimada,
+                bloqueado: bloqueoConsumo,
+                historial: List.unmodifiable(historialCorriente),
+                onDesbloquear: isConnected ? confirmarDesbloqueo : null,
+                onReiniciarContador: isConnected ? confirmarReinicioContador : null,
+              )
+            else
+              const Card(
+                child: ListTile(
+                  leading: Icon(Icons.show_chart),
+                  title: Text('Consumo de Corriente'),
+                  subtitle: Text('Conéctate a la ESP32 para ver la gráfica'),
+                ),
+              ),
           ],
         ),
       ),

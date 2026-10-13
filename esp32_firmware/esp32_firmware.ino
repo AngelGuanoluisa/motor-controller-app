@@ -61,6 +61,15 @@ int limiteCorriente_mA = 0;      // Protección de sobrecorriente (0 = desactiva
 float corrienteFiltrada_mA = 0;  // Valor promedio actual (filtrado)
 float corrientePico_mA = 0;      // Pico desde el último reset (CUR_RESET)
 float energia_mAh = 0;           // Carga consumida acumulada (mAh)
+
+// LÍMITE DE CONSUMO (mAh): al alcanzarlo se activa el paro de emergencia y el
+// motor queda BLOQUEADO (RESET_E no lo libera, ni siquiera tras reiniciar la
+// ESP32). Para desbloquear hay que reiniciar el contador con CUR_RESET.
+int limiteConsumo_mAh = 750;     // 0 = sin límite
+bool bloqueoConsumo = false;
+float energiaGuardada_mAh = 0;   // Último valor escrito en flash
+unsigned long ultimoGuardadoConsumo = 0;
+const unsigned long GUARDADO_CONSUMO_MS = 30000; // Guardar mAh cada 30 s como máximo
 unsigned long proximaMuestraUs = 0;
 unsigned long ultimoCalculoCorriente = 0;
 unsigned long ultimoEnvioCorriente = 0;
@@ -116,6 +125,7 @@ void tareaCorriente();
 void calibrarCeroCorriente();
 void enviarCorrienteBLE();
 void imprimirCorriente();
+void guardarConsumo();
 
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
@@ -184,6 +194,10 @@ void cargarConfiguracion() {
   offsetL_mV = prefs.getInt("offL", 0);
   corrienteNominal_mA = prefs.getInt("iNom", 2000);
   limiteCorriente_mA = prefs.getInt("iLim", 0);
+  limiteConsumo_mAh = prefs.getInt("mahLim", 750);
+  energia_mAh = prefs.getFloat("mah", 0);
+  bloqueoConsumo = prefs.getBool("lockMah", false);
+  energiaGuardada_mAh = energia_mAh;
   prefs.end();
 
   Serial.println("[CONFIG] Parametros cargados de memoria Flash (NVS):");
@@ -194,6 +208,8 @@ void cargarConfiguracion() {
   Serial.printf(" - Corriente: modo %s | kILIS=%.0f | R_IS=%.0f ohm | Offset R/L=%d/%d mV | I_nom=%d mA | Limite=%d mA\n",
                 modoSensorCorriente ? "SENSOR" : "ESTIMADO", kILIS, resistenciaIS,
                 offsetR_mV, offsetL_mV, corrienteNominal_mA, limiteCorriente_mA);
+  Serial.printf(" - Consumo acumulado: %.1f mAh | Limite: %d mAh | Bloqueado: %s\n",
+                energia_mAh, limiteConsumo_mAh, bloqueoConsumo ? "SI" : "NO");
 }
 
 void guardarConfiguracion() {
@@ -211,6 +227,7 @@ void guardarConfiguracion() {
   prefs.putInt("offL", offsetL_mV);
   prefs.putInt("iNom", corrienteNominal_mA);
   prefs.putInt("iLim", limiteCorriente_mA);
+  prefs.putInt("mahLim", limiteConsumo_mAh);
   prefs.end();
   Serial.println("[CONFIG] Parametros guardados permanentemente en Flash.");
 }
@@ -235,6 +252,11 @@ void setup() {
   cargarConfiguracion();
   reconfigurarPWM();
   aplicarMotor(0, 0);
+  if (bloqueoConsumo) {
+    paroEmergencia = true;
+    actualizarSalida();
+    Serial.println("[!] Motor BLOQUEADO por limite de consumo. Envia CUR_RESET para desbloquear.");
+  }
 
   // Iniciar BLE
   BLEDevice::init("ESP32-MotorBTS");
@@ -366,6 +388,20 @@ void tareaCorriente() {
     if (corrienteFiltrada_mA > corrientePico_mA) corrientePico_mA = corrienteFiltrada_mA;
     energia_mAh += corrienteFiltrada_mA * dt_h;
 
+    // Límite de consumo acumulado (mAh) -> paro de emergencia con bloqueo
+    if (limiteConsumo_mAh > 0 && !bloqueoConsumo && energia_mAh >= limiteConsumo_mAh) {
+      bloqueoConsumo = true;
+      Serial.printf("\n[!] LIMITE DE CONSUMO ALCANZADO: %.1f mAh (limite %d mAh). Motor BLOQUEADO.\n",
+                    energia_mAh, limiteConsumo_mAh);
+      procesarComando("E");
+      guardarConsumo();
+      enviarNotificacionBLE("ALERT:MAH_LIMIT");
+    }
+    // Guardar periódicamente el consumo para no perderlo si se corta la energía
+    if (ahora - ultimoGuardadoConsumo >= GUARDADO_CONSUMO_MS && energia_mAh - energiaGuardada_mAh >= 0.5) {
+      guardarConsumo();
+    }
+
     // 3) Protección de sobrecorriente (solo si hay límite configurado).
     //    Se exigen 3 ventanas seguidas (300 ms) para ignorar el pico de arranque.
     if (limiteCorriente_mA > 0 && !paroEmergencia) {
@@ -392,6 +428,15 @@ void tareaCorriente() {
   }
 }
 
+void guardarConsumo() {
+  ultimoGuardadoConsumo = millis();
+  energiaGuardada_mAh = energia_mAh;
+  prefs.begin("motor_cfg", false);
+  prefs.putFloat("mah", energia_mAh);
+  prefs.putBool("lockMah", bloqueoConsumo);
+  prefs.end();
+}
+
 void calibrarCeroCorriente() {
   // Con el motor detenido, la tensión en IS es solo el offset del driver
   // (más el error del ADC). Se guarda para restarlo en cada medición.
@@ -410,18 +455,22 @@ void calibrarCeroCorriente() {
 }
 
 void enviarCorrienteBLE() {
-  // CUR:<mA promedio>,<mA pico>,<mAh>,<S|E>   (S = sensor, E = estimado)
+  // CUR:<mA promedio>,<mA pico>,<mAh>,<S|E>,<límite mAh>,<bloqueado 0|1>
+  // (S = sensor, E = estimado)
   String curStr = "CUR:" + String((int)corrienteFiltrada_mA) + "," +
                   String((int)corrientePico_mA) + "," +
                   String(energia_mAh, 1) + "," +
-                  (modoSensorCorriente ? "S" : "E");
+                  (modoSensorCorriente ? "S" : "E") + "," +
+                  String(limiteConsumo_mAh) + "," +
+                  (bloqueoConsumo ? "1" : "0");
   enviarNotificacionBLE(curStr);
 }
 
 void imprimirCorriente() {
-  Serial.printf("[CORRIENTE %s] Promedio: %.2f A | Pico: %.2f A | Consumido: %.1f mAh | PWM: %d\n",
+  Serial.printf("[CORRIENTE %s] Promedio: %.2f A | Pico: %.2f A | Consumido: %.1f / %d mAh | PWM: %d\n",
                 modoSensorCorriente ? "MEDIDA" : "ESTIMADA",
-                corrienteFiltrada_mA / 1000.0, corrientePico_mA / 1000.0, energia_mAh, velocidadActual);
+                corrienteFiltrada_mA / 1000.0, corrientePico_mA / 1000.0, energia_mAh,
+                limiteConsumo_mAh, velocidadActual);
 }
 
 void enviarNotificacionBLE(String mensaje) {
@@ -487,10 +536,44 @@ void procesarComando(String cmd) {
   }
 
   if (cmd == "RESET_E") {
+    if (bloqueoConsumo) {
+      Serial.println("[ERROR] Motor bloqueado por limite de consumo. Envia CUR_RESET para desbloquear.");
+      enviarNotificacionBLE("ALERT:LOCKED");
+      return;
+    }
     paroEmergencia = false;
     actualizarSalida();
     Serial.println("[OK] Emergencia restablecida.");
     imprimirEstado();
+    return;
+  }
+
+  // Comandos de consumo: se aceptan incluso durante la emergencia
+  if (cmd == "CUR_RESET") {
+    corrientePico_mA = 0;
+    energia_mAh = 0;
+    bool estabaBloqueado = bloqueoConsumo;
+    bloqueoConsumo = false;
+    guardarConsumo();
+    Serial.println("[OK] Pico y mAh acumulados reiniciados.");
+    if (estabaBloqueado) Serial.println("[OK] Bloqueo por consumo liberado. Envia RESET_E para rearmar.");
+    enviarCorrienteBLE();
+    return;
+  }
+  if (cmd.startsWith("SET_MAH_LIM:")) {
+    int lim = cmd.substring(12).toInt();
+    if (lim >= 0 && lim <= 100000) {
+      limiteConsumo_mAh = lim;
+      guardarConfiguracion();
+      if (lim == 0) Serial.println("[CFG] Limite de consumo DESACTIVADO");
+      else Serial.printf("[CFG] Limite de consumo: %d mAh\n", limiteConsumo_mAh);
+      enviarCorrienteBLE();
+    }
+    return;
+  }
+  if (cmd == "CUR" || cmd == "GET_CUR") {
+    imprimirCorriente();
+    enviarCorrienteBLE();
     return;
   }
 
@@ -508,6 +591,7 @@ void procesarComando(String cmd) {
     enMarcha = false;
     if (rampTimeMs <= 0) velocidadActual = 0;
     actualizarSalida();
+    guardarConsumo();
     Serial.println("[OK] Detenido.");
   } else if (cmd == "DIR:CW") {
     sentidoActual = HORARIO;
@@ -566,14 +650,7 @@ void procesarComando(String cmd) {
   }
 
   // COMANDOS DE CORRIENTE
-  else if (cmd == "CUR" || cmd == "GET_CUR") {
-    imprimirCorriente();
-    enviarCorrienteBLE();
-  } else if (cmd == "CUR_RESET") {
-    corrientePico_mA = 0;
-    energia_mAh = 0;
-    Serial.println("[OK] Pico y mAh acumulados reiniciados.");
-  } else if (cmd == "CAL_I0") {
+  else if (cmd == "CAL_I0") {
     if (enMarcha || velocidadActual > 0) {
       Serial.println("[ERROR] Detén el motor (STOP) antes de calibrar el cero.");
     } else {
