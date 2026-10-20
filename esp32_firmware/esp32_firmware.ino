@@ -1,3 +1,26 @@
+/*
+ * Control de motor DC con ESP32 + BTS7960 (IBT-2) por BLE y Monitor Serie
+ * ----------------------------------------------------------------------
+ * Conexiones (ESP32 -> BTS7960):
+ *   GPIO25 -> RPWM      (giro "adelante" / CW)
+ *   GPIO26 -> LPWM      (giro "atrás" / CCW)
+ *   GPIO27 -> R_EN
+ *   GPIO14 -> L_EN
+ *   GPIO34 -> R_IS      (solo entrada, ADC1)
+ *   GPIO35 -> L_IS      (solo entrada, ADC1)
+ *   3V3    -> VCC lógica del módulo
+ *   GND    -> GND (común con la fuente del motor)
+ *
+ * Corriente: I_motor = (V_IS / R_IS) * K_ILIS
+ *   El IBT-2 trae R_IS = 1 kΩ. El módulo tiene DOS chips (uno por lado) y cada
+ *   uno está calibrado por separado: ADELANTE -> R_IS / K_ILIS_R,
+ *   ATRAS -> L_IS / K_ILIS_L. Solo el chip del lado activo mide la corriente.
+ *
+ * Protección: si la corriente supera el límite (1.05 A por defecto,
+ * configurable con SET_ILIM:<mA> o desde la app) se activa el paro de
+ * emergencia y el motor se detiene.
+ */
+
 #include <Arduino.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -8,16 +31,20 @@
 // ==========================================
 // PINES BTS7960
 // ==========================================
-const int PIN_RPWM = 32;
-const int PIN_LPWM = 33;
-const int PIN_R_EN = 25;
-const int PIN_L_EN = 26;
-
-// Sensado de corriente del BTS7960 (pines R_IS y L_IS del módulo IBT-2).
-// Deben ir a pines ADC1 (el ADC2 no funciona con Bluetooth activo).
-// GPIO 34 y 35 son solo de entrada, ideales para esto.
+const int PIN_RPWM = 25;
+const int PIN_LPWM = 26;
+const int PIN_R_EN = 27;
+const int PIN_L_EN = 14;
 const int PIN_R_IS = 34;
 const int PIN_L_IS = 35;
+
+// ==========================================
+// SENSADO DE CORRIENTE (valores calibrados)
+// ==========================================
+const float K_ILIS_R    = 566.0f;   // Relación I_carga / I_IS, chip lado R (adelante)
+const float K_ILIS_L    = 793.5f;   // Relación I_carga / I_IS, chip lado L (atrás)
+const float R_IS_OHMS   = 1000.0f;  // Resistencia en el pin IS (la del IBT-2)
+const int   ADC_SAMPLES = 32;       // Muestras a promediar por lectura
 
 // ==========================================
 // GESTOR DE PARÁMETROS EN MEMORIA FLASH
@@ -25,64 +52,17 @@ const int PIN_L_IS = 35;
 Preferences prefs;
 
 // Parámetros configurables con valores por defecto
-int pwmFreq = 20000;         // Frecuencia PWM en Hz (100 Hz a 40000 Hz)
-int pwmResolution = 8;       // Resolución (8 bits: 0-255)
-int speedMin = 0;            // Límite mínimo de velocidad
-int speedMax = 255;          // Límite máximo de velocidad
-int rampTimeMs = 500;        // Tiempo de rampa de aceleración/deceleración en ms (0 = instantáneo)
+int pwmFreq = 20000;          // Frecuencia PWM en Hz (100 Hz a 40000 Hz)
+int pwmResolution = 8;        // Resolución (8 bits: 0-255)
+int speedMin = 0;             // Límite mínimo de velocidad
+int speedMax = 255;           // Límite máximo de velocidad
+int rampTimeMs = 500;         // Tiempo de rampa de aceleración/deceleración en ms (0 = instantáneo)
 bool invertDirection = false; // Invertir lógica de giro (CW <-> CCW)
 
-// ==========================================
-// MEDICIÓN / ESTIMACIÓN DE CORRIENTE
-// ==========================================
-// El BTS7960 entrega por IS una corriente proporcional a la del motor:
-//     I_IS = I_motor / kILIS        (kILIS típico = 8500)
-// Con una resistencia R_IS de IS a GND se obtiene una tensión:
-//     V_IS = I_motor * R_IS / kILIS   ->   I_motor = V_IS * kILIS / R_IS
-// Con R_IS = 680 ohm: 1 V equivale a 12.5 A; 3.1 V (máx. ADC) ~ 38 A.
-// IMPORTANTE: ante un fallo el BTS7960 saca hasta ~4.5 mA por IS. Con 680 ohm
-// eso da ~3.06 V (seguro para la ESP32); con 1 kOhm daría 4.5 V y dañaría el pin.
-//
-// Modo SENSOR: usa la lectura real de R_IS + L_IS.
-// Modo ESTIMADO: sin sensor, aproxima I = corrienteNominal * (PWM / 255).
-//   "corrienteNominal" se obtiene midiendo una vez con un multímetro/pinza
-//   la corriente con el motor a PWM 255 y su carga habitual.
-//
-// Nota: con PWM, la corriente de la fuente es pulsante; el valor reportado
-// es el PROMEDIO (lo que marcaría un multímetro en serie con la fuente).
-bool modoSensorCorriente = true; // true = SENSOR (IS), false = ESTIMADO
-float kILIS = 8500.0;            // Relación de sensado del BTS7960 (datasheet: 8500 típ.)
-float resistenciaIS = 680.0;     // Resistencia de IS a GND en ohmios
-int offsetR_mV = 0;              // Tensión en R_IS con motor detenido (calibración)
-int offsetL_mV = 0;              // Tensión en L_IS con motor detenido (calibración)
-int corrienteNominal_mA = 2000;  // Para modo ESTIMADO: corriente a PWM 255
-int limiteCorriente_mA = 0;      // Protección de sobrecorriente (0 = desactivada)
-
-float corrienteFiltrada_mA = 0;  // Valor promedio actual (filtrado)
-float corrientePico_mA = 0;      // Pico desde el último reset (CUR_RESET)
-float energia_mAh = 0;           // Carga consumida acumulada (mAh)
-
-// LÍMITE DE CONSUMO (mAh): al alcanzarlo se activa el paro de emergencia y el
-// motor queda BLOQUEADO (RESET_E no lo libera, ni siquiera tras reiniciar la
-// ESP32). Para desbloquear hay que reiniciar el contador con CUR_RESET.
-int limiteConsumo_mAh = 750;     // 0 = sin límite
-bool bloqueoConsumo = false;
-float energiaGuardada_mAh = 0;   // Último valor escrito en flash
-unsigned long ultimoGuardadoConsumo = 0;
-const unsigned long GUARDADO_CONSUMO_MS = 30000; // Guardar mAh cada 30 s como máximo
-unsigned long proximaMuestraUs = 0;
-unsigned long ultimoCalculoCorriente = 0;
-unsigned long ultimoEnvioCorriente = 0;
-unsigned long ultimoLogCorriente = 0;
-long acumR_mV = 0, acumL_mV = 0;
-int numMuestras = 0;
-int muestrasSaturadas = 0;
-int ventanasSobrecorriente = 0;
-bool logCorrienteSerie = true;
-
-const int ADC_SATURACION_MV = 3000;          // Cerca del máximo del ADC del ESP32
-const unsigned long VENTANA_CORRIENTE_MS = 100;
-const unsigned long ENVIO_CORRIENTE_MS = 250;
+// Protección por corriente
+int limiteCorriente_mA = 1050; // Límite de corriente (0 = desactivado)
+int tiempoLimiteMs = 150;      // Tiempo continuo por encima del límite para disparar
+int tiempoBlankingMs = 500;    // Tiempo ignorado tras arrancar / cambiar de sentido / acelerar
 
 #if ESP_ARDUINO_VERSION < ESP_ARDUINO_VERSION_VAL(3, 0, 0)
 const int PWM_CHAN_R = 0;
@@ -108,8 +88,24 @@ int velocidadObjetivo = 150;  // Velocidad seleccionada
 Sentido sentidoActual = HORARIO;
 bool enMarcha = false;
 bool paroEmergencia = false;
+char ladoActivo = '-';        // 'R' = RPWM activo, 'L' = LPWM activo, '-' = ninguno
 
 unsigned long lastRampUpdate = 0;
+
+// Estado de la medición de corriente
+float offsetR_mV = 0;
+float offsetL_mV = 0;
+float corriente_mA = 0;       // Última lectura del lado activo
+float corrientePico_mA = 0;   // Pico desde el último START
+unsigned long ultimaLecturaCorriente = 0;
+unsigned long ultimoEnvioCorriente = 0;
+unsigned long ultimoLogCorriente = 0;
+unsigned long inicioMovimiento = 0; // Para ignorar el pico de arranque
+unsigned long inicioExceso = 0;     // 0 = la corriente no está por encima del límite
+bool logCorrienteSerie = true;
+
+const unsigned long LECTURA_CORRIENTE_MS = 50;
+const unsigned long ENVIO_CORRIENTE_MS = 250;
 
 void reconfigurarPWM();
 void cargarConfiguracion();
@@ -122,10 +118,9 @@ void enviarNotificacionBLE(String mensaje);
 void enviarConfiguracionBLE();
 void imprimirEstado();
 void tareaCorriente();
-void calibrarCeroCorriente();
+void calibrarOffset();
 void enviarCorrienteBLE();
 void imprimirCorriente();
-void guardarConsumo();
 
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
@@ -146,7 +141,7 @@ class MyCallbacks: public BLECharacteristicCallbacks {
         std::string val = pCharacteristic->getValue();
         String rxValue = String(val.c_str());
       #endif
-      
+
       rxValue.trim();
       if (rxValue.length() > 0) {
         Serial.print("[BLE Comando]: ");
@@ -187,17 +182,9 @@ void cargarConfiguracion() {
   speedMax = prefs.getInt("spdMax", 255);
   rampTimeMs = prefs.getInt("ramp", 500);
   invertDirection = prefs.getBool("invDir", false);
-  modoSensorCorriente = prefs.getBool("curSensor", true);
-  kILIS = prefs.getFloat("kilis", 8500.0);
-  resistenciaIS = prefs.getFloat("rIS", 680.0);
-  offsetR_mV = prefs.getInt("offR", 0);
-  offsetL_mV = prefs.getInt("offL", 0);
-  corrienteNominal_mA = prefs.getInt("iNom", 2000);
-  limiteCorriente_mA = prefs.getInt("iLim", 0);
-  limiteConsumo_mAh = prefs.getInt("mahLim", 750);
-  energia_mAh = prefs.getFloat("mah", 0);
-  bloqueoConsumo = prefs.getBool("lockMah", false);
-  energiaGuardada_mAh = energia_mAh;
+  limiteCorriente_mA = prefs.getInt("iLimBts", 1050);
+  tiempoLimiteMs = prefs.getInt("tLimite", 150);
+  tiempoBlankingMs = prefs.getInt("tBlank", 500);
   prefs.end();
 
   Serial.println("[CONFIG] Parametros cargados de memoria Flash (NVS):");
@@ -205,11 +192,8 @@ void cargarConfiguracion() {
   Serial.printf(" - Limites Velocidad: Min=%d, Max=%d\n", speedMin, speedMax);
   Serial.printf(" - Rampa de aceleracion: %d ms\n", rampTimeMs);
   Serial.printf(" - Inversion de sentido: %s\n", invertDirection ? "SI" : "NO");
-  Serial.printf(" - Corriente: modo %s | kILIS=%.0f | R_IS=%.0f ohm | Offset R/L=%d/%d mV | I_nom=%d mA | Limite=%d mA\n",
-                modoSensorCorriente ? "SENSOR" : "ESTIMADO", kILIS, resistenciaIS,
-                offsetR_mV, offsetL_mV, corrienteNominal_mA, limiteCorriente_mA);
-  Serial.printf(" - Consumo acumulado: %.1f mAh | Limite: %d mAh | Bloqueado: %s\n",
-                energia_mAh, limiteConsumo_mAh, bloqueoConsumo ? "SI" : "NO");
+  Serial.printf(" - Limite de corriente: %d mA durante %d ms (se ignoran %d ms al arrancar)\n",
+                limiteCorriente_mA, tiempoLimiteMs, tiempoBlankingMs);
 }
 
 void guardarConfiguracion() {
@@ -220,14 +204,9 @@ void guardarConfiguracion() {
   prefs.putInt("spdMax", speedMax);
   prefs.putInt("ramp", rampTimeMs);
   prefs.putBool("invDir", invertDirection);
-  prefs.putBool("curSensor", modoSensorCorriente);
-  prefs.putFloat("kilis", kILIS);
-  prefs.putFloat("rIS", resistenciaIS);
-  prefs.putInt("offR", offsetR_mV);
-  prefs.putInt("offL", offsetL_mV);
-  prefs.putInt("iNom", corrienteNominal_mA);
-  prefs.putInt("iLim", limiteCorriente_mA);
-  prefs.putInt("mahLim", limiteConsumo_mAh);
+  prefs.putInt("iLimBts", limiteCorriente_mA);
+  prefs.putInt("tLimite", tiempoLimiteMs);
+  prefs.putInt("tBlank", tiempoBlankingMs);
   prefs.end();
   Serial.println("[CONFIG] Parametros guardados permanentemente en Flash.");
 }
@@ -235,28 +214,25 @@ void guardarConfiguracion() {
 void aplicarMotor(int pwmR, int pwmL) {
   setPwm(PIN_RPWM, 0, pwmR);
   setPwm(PIN_LPWM, 1, pwmL);
+  ladoActivo = pwmR > 0 ? 'R' : (pwmL > 0 ? 'L' : '-');
 }
 
 void setup() {
   Serial.begin(115200);
+  delay(300);
 
   pinMode(PIN_R_EN, OUTPUT);
   pinMode(PIN_L_EN, OUTPUT);
-  digitalWrite(PIN_R_EN, HIGH);
-  digitalWrite(PIN_L_EN, HIGH);
 
-  pinMode(PIN_R_IS, INPUT);
-  pinMode(PIN_L_IS, INPUT);
-  analogReadResolution(12); // Atenuación por defecto 11 dB: rango ~0-3.1 V
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_R_IS, ADC_11db);  // rango ~0..3.1 V
+  analogSetPinAttenuation(PIN_L_IS, ADC_11db);
 
   cargarConfiguracion();
   reconfigurarPWM();
   aplicarMotor(0, 0);
-  if (bloqueoConsumo) {
-    paroEmergencia = true;
-    actualizarSalida();
-    Serial.println("[!] Motor BLOQUEADO por limite de consumo. Envia CUR_RESET para desbloquear.");
-  }
+  calibrarOffset();   // Con el motor detenido
+  actualizarSalida();
 
   // Iniciar BLE
   BLEDevice::init("ESP32-MotorBTS");
@@ -319,7 +295,7 @@ void loop() {
     }
   }
 
-  // Medición / estimación de corriente (no bloqueante)
+  // Medición de corriente y protección
   tareaCorriente();
 
   // Comandos Serial (PC)
@@ -331,93 +307,80 @@ void loop() {
 }
 
 // ==========================================
-// CORRIENTE: muestreo, filtrado y protección
+// CORRIENTE
 // ==========================================
-float corrienteDesdeMilivoltios(float mV) {
+float leerMilliVolts(int pin) {
+  uint32_t suma = 0;
+  for (int i = 0; i < ADC_SAMPLES; i++) {
+    suma += analogReadMilliVolts(pin);   // usa la calibración de fábrica del ADC
+  }
+  return (float)suma / ADC_SAMPLES;
+}
+
+float mVaAmperes(float mV, float k) {
   if (mV < 0) mV = 0;
-  // I_motor[mA] = V_IS[mV] * kILIS / R_IS[ohm]
-  return mV * kILIS / resistenciaIS;
+  return (mV / 1000.0f) / R_IS_OHMS * k;
+}
+
+void leerCorriente(float &iR, float &iL, float &mvR, float &mvL) {
+  mvR = leerMilliVolts(PIN_R_IS) - offsetR_mV;
+  mvL = leerMilliVolts(PIN_L_IS) - offsetL_mV;
+  iR = mVaAmperes(mvR, K_ILIS_R);
+  iL = mVaAmperes(mvL, K_ILIS_L);
+}
+
+// Solo el chip del lado activo mide la corriente; el otro se ignora
+float corrienteActiva(float iR, float iL) {
+  if (ladoActivo == 'R') return iR;
+  if (ladoActivo == 'L') return iL;
+  return iR + iL;
+}
+
+void calibrarOffset() {
+  // Igual que en la prueba de calibración: motor detenido y puentes deshabilitados
+  aplicarMotor(0, 0);
+  digitalWrite(PIN_R_EN, LOW);
+  digitalWrite(PIN_L_EN, LOW);
+  delay(200);
+  offsetR_mV = leerMilliVolts(PIN_R_IS);
+  offsetL_mV = leerMilliVolts(PIN_L_IS);
+  Serial.printf("[CAL] Offset calibrado: R=%.1f mV, L=%.1f mV\n", offsetR_mV, offsetL_mV);
 }
 
 void tareaCorriente() {
-  unsigned long ahoraUs = micros();
-
-  // 1) Tomar una muestra cada ~1 ms con un pequeño retardo aleatorio para no
-  //    "sincronizarse" con el PWM (20 kHz es múltiplo exacto de 1 kHz) y así
-  //    obtener un promedio real de la señal pulsante.
-  if (modoSensorCorriente && (long)(ahoraUs - proximaMuestraUs) >= 0) {
-    proximaMuestraUs = ahoraUs + 700 + random(0, 600);
-    int mvR = analogReadMilliVolts(PIN_R_IS);
-    int mvL = analogReadMilliVolts(PIN_L_IS);
-    acumR_mV += mvR;
-    acumL_mV += mvL;
-    numMuestras++;
-    // Si IS queda pegado arriba: sobrecorriente fuerte o fallo del driver
-    // (el BTS7960 fuerza IS a su valor máximo ante sobretemperatura/corto).
-    if (mvR >= ADC_SATURACION_MV || mvL >= ADC_SATURACION_MV) muestrasSaturadas++;
-  }
-
-  // 2) Cada 100 ms calcular el promedio de la ventana
   unsigned long ahora = millis();
-  if (ahora - ultimoCalculoCorriente >= VENTANA_CORRIENTE_MS) {
-    float dt_h = (ahora - ultimoCalculoCorriente) / 3600000.0;
-    ultimoCalculoCorriente = ahora;
 
-    float instantanea_mA = 0;
-    bool saturado = false;
-    if (modoSensorCorriente) {
-      if (numMuestras > 0) {
-        // Se suman ambos lados: el medio puente inactivo solo aporta su offset,
-        // así no importa el sentido de giro.
-        float mvR = (float)acumR_mV / numMuestras - offsetR_mV;
-        float mvL = (float)acumL_mV / numMuestras - offsetL_mV;
-        instantanea_mA = corrienteDesdeMilivoltios(mvR) + corrienteDesdeMilivoltios(mvL);
-        saturado = muestrasSaturadas > numMuestras / 2;
+  bool motorActivo = !paroEmergencia && velocidadActual > 0;
+  if (!motorActivo) inicioMovimiento = ahora; // El tiempo ignorado cuenta desde que arranca
+
+  if (ahora - ultimaLecturaCorriente >= LECTURA_CORRIENTE_MS) {
+    ultimaLecturaCorriente = ahora;
+
+    float iR, iL, mvR, mvL;
+    leerCorriente(iR, iL, mvR, mvL);
+    corriente_mA = corrienteActiva(iR, iL) * 1000.0f;
+    if (motorActivo && corriente_mA > corrientePico_mA) corrientePico_mA = corriente_mA;
+
+    // Protección: límite de corriente sostenido durante tiempoLimiteMs,
+    // ignorando el pico de arranque (tiempoBlankingMs).
+    bool enBlanking = ahora - inicioMovimiento < (unsigned long)tiempoBlankingMs;
+    if (limiteCorriente_mA > 0 && motorActivo && !enBlanking && corriente_mA > limiteCorriente_mA) {
+      if (inicioExceso == 0) inicioExceso = ahora;
+      if (ahora - inicioExceso >= (unsigned long)tiempoLimiteMs) {
+        inicioExceso = 0;
+        float medida = corriente_mA;
+        char lado = ladoActivo;
+        procesarComando("E");
+        Serial.printf("!! LIMITE DE CORRIENTE: %.0f mA > %d mA (lado %c). Motor detenido.\n",
+                      medida, limiteCorriente_mA, lado);
+        Serial.printf("   Para continuar: RESET_E, DIR:%s y START.\n", sentidoActual == HORARIO ? "CCW" : "CW");
+        enviarNotificacionBLE("ALERT:GRIP");
       }
     } else {
-      // Estimación sin sensor: proporcional al ciclo útil del PWM
-      instantanea_mA = paroEmergencia ? 0 : corrienteNominal_mA * (velocidadActual / 255.0);
-    }
-    acumR_mV = acumL_mV = 0;
-    numMuestras = 0;
-    muestrasSaturadas = 0;
-
-    // Filtro exponencial para suavizar la lectura
-    corrienteFiltrada_mA = 0.7 * corrienteFiltrada_mA + 0.3 * instantanea_mA;
-    if (corrienteFiltrada_mA < 5) corrienteFiltrada_mA = 0; // Ruido del ADC
-    if (corrienteFiltrada_mA > corrientePico_mA) corrientePico_mA = corrienteFiltrada_mA;
-    energia_mAh += corrienteFiltrada_mA * dt_h;
-
-    // Límite de consumo acumulado (mAh) -> paro de emergencia con bloqueo
-    if (limiteConsumo_mAh > 0 && !bloqueoConsumo && energia_mAh >= limiteConsumo_mAh) {
-      bloqueoConsumo = true;
-      Serial.printf("\n[!] LIMITE DE CONSUMO ALCANZADO: %.1f mAh (limite %d mAh). Motor BLOQUEADO.\n",
-                    energia_mAh, limiteConsumo_mAh);
-      procesarComando("E");
-      guardarConsumo();
-      enviarNotificacionBLE("ALERT:MAH_LIMIT");
-    }
-    // Guardar periódicamente el consumo para no perderlo si se corta la energía
-    if (ahora - ultimoGuardadoConsumo >= GUARDADO_CONSUMO_MS && energia_mAh - energiaGuardada_mAh >= 0.5) {
-      guardarConsumo();
-    }
-
-    // 3) Protección de sobrecorriente (solo si hay límite configurado).
-    //    Se exigen 3 ventanas seguidas (300 ms) para ignorar el pico de arranque.
-    if (limiteCorriente_mA > 0 && !paroEmergencia) {
-      bool exceso = corrienteFiltrada_mA > limiteCorriente_mA || (modoSensorCorriente && saturado);
-      ventanasSobrecorriente = exceso ? ventanasSobrecorriente + 1 : 0;
-      if (ventanasSobrecorriente >= 3) {
-        ventanasSobrecorriente = 0;
-        Serial.printf("\n[!] SOBRECORRIENTE: %.0f mA (limite %d mA)%s\n", corrienteFiltrada_mA,
-                      limiteCorriente_mA, saturado ? " - IS saturado / fallo del driver" : "");
-        procesarComando("E");
-        enviarNotificacionBLE("ALERT:OVERCURRENT");
-      }
+      inicioExceso = 0;
     }
   }
 
-  // 4) Enviar a la app por BLE y mostrar por Serial
   if (deviceConnected && ahora - ultimoEnvioCorriente >= ENVIO_CORRIENTE_MS) {
     ultimoEnvioCorriente = ahora;
     enviarCorrienteBLE();
@@ -428,49 +391,22 @@ void tareaCorriente() {
   }
 }
 
-void guardarConsumo() {
-  ultimoGuardadoConsumo = millis();
-  energiaGuardada_mAh = energia_mAh;
-  prefs.begin("motor_cfg", false);
-  prefs.putFloat("mah", energia_mAh);
-  prefs.putBool("lockMah", bloqueoConsumo);
-  prefs.end();
-}
-
-void calibrarCeroCorriente() {
-  // Con el motor detenido, la tensión en IS es solo el offset del driver
-  // (más el error del ADC). Se guarda para restarlo en cada medición.
-  long sumaR = 0, sumaL = 0;
-  const int N = 200;
-  for (int i = 0; i < N; i++) {
-    sumaR += analogReadMilliVolts(PIN_R_IS);
-    sumaL += analogReadMilliVolts(PIN_L_IS);
-    delay(2);
-  }
-  offsetR_mV = sumaR / N;
-  offsetL_mV = sumaL / N;
-  corrienteFiltrada_mA = 0;
-  guardarConfiguracion();
-  Serial.printf("[CAL] Cero de corriente: R_IS=%d mV, L_IS=%d mV (guardado)\n", offsetR_mV, offsetL_mV);
-}
-
 void enviarCorrienteBLE() {
-  // CUR:<mA promedio>,<mA pico>,<mAh>,<S|E>,<límite mAh>,<bloqueado 0|1>
-  // (S = sensor, E = estimado)
-  String curStr = "CUR:" + String((int)corrienteFiltrada_mA) + "," +
+  // CUR:<mA actual>,<mA pico>,<lado R|L|->,<límite mA>
+  String curStr = "CUR:" + String((int)corriente_mA) + "," +
                   String((int)corrientePico_mA) + "," +
-                  String(energia_mAh, 1) + "," +
-                  (modoSensorCorriente ? "S" : "E") + "," +
-                  String(limiteConsumo_mAh) + "," +
-                  (bloqueoConsumo ? "1" : "0");
+                  String(ladoActivo) + "," +
+                  String(limiteCorriente_mA);
   enviarNotificacionBLE(curStr);
 }
 
 void imprimirCorriente() {
-  Serial.printf("[CORRIENTE %s] Promedio: %.2f A | Pico: %.2f A | Consumido: %.1f / %d mAh | PWM: %d\n",
-                modoSensorCorriente ? "MEDIDA" : "ESTIMADA",
-                corrienteFiltrada_mA / 1000.0, corrientePico_mA / 1000.0, energia_mAh,
-                limiteConsumo_mAh, velocidadActual);
+  float iR, iL, mvR, mvL;
+  leerCorriente(iR, iL, mvR, mvL);
+  Serial.printf("[CORRIENTE] Lado %c PWM=%3d | R_IS=%6.1f mV (%.2f A) | L_IS=%6.1f mV (%.2f A) | "
+                "I=%.2f A | pico=%.2f A | limite=%.2f A\n",
+                ladoActivo, velocidadActual, mvR, iR, mvL, iL,
+                corriente_mA / 1000.0f, corrientePico_mA / 1000.0f, limiteCorriente_mA / 1000.0f);
 }
 
 void enviarNotificacionBLE(String mensaje) {
@@ -492,9 +428,9 @@ void enviarConfiguracionBLE() {
 
 void actualizarSalida() {
   if (paroEmergencia) {
-    digitalWrite(PIN_R_EN, LOW);
-    digitalWrite(PIN_L_EN, LOW);
     aplicarMotor(0, 0);
+    digitalWrite(PIN_R_EN, LOW);  // Puentes deshabilitados -> rueda libre
+    digitalWrite(PIN_L_EN, LOW);
     velocidadActual = 0;
   } else {
     digitalWrite(PIN_R_EN, HIGH);
@@ -522,6 +458,20 @@ void actualizarSalida() {
   enviarNotificacionBLE(estadoStr);
 }
 
+// Cambio de sentido: si el motor está girando, frenar primero para evitar picos
+void cambiarSentido(Sentido nuevo) {
+  if (nuevo == sentidoActual) return;
+  if (velocidadActual > 0) {
+    aplicarMotor(0, 0);   // EN activos + ambos lados bajos -> freno
+    delay(300);
+    velocidadActual = (rampTimeMs <= 0 && enMarcha) ? velocidadObjetivo : 0;
+  }
+  sentidoActual = nuevo;
+  inicioMovimiento = millis();
+  corrientePico_mA = 0;
+  actualizarSalida();
+}
+
 void procesarComando(String cmd) {
   cmd.toUpperCase();
 
@@ -536,11 +486,6 @@ void procesarComando(String cmd) {
   }
 
   if (cmd == "RESET_E") {
-    if (bloqueoConsumo) {
-      Serial.println("[ERROR] Motor bloqueado por limite de consumo. Envia CUR_RESET para desbloquear.");
-      enviarNotificacionBLE("ALERT:LOCKED");
-      return;
-    }
     paroEmergencia = false;
     actualizarSalida();
     Serial.println("[OK] Emergencia restablecida.");
@@ -548,42 +493,18 @@ void procesarComando(String cmd) {
     return;
   }
 
-  // Comandos de consumo: se aceptan incluso durante la emergencia
-  if (cmd == "CUR_RESET") {
-    corrientePico_mA = 0;
-    energia_mAh = 0;
-    bool estabaBloqueado = bloqueoConsumo;
-    bloqueoConsumo = false;
-    guardarConsumo();
-    Serial.println("[OK] Pico y mAh acumulados reiniciados.");
-    if (estabaBloqueado) Serial.println("[OK] Bloqueo por consumo liberado. Envia RESET_E para rearmar.");
-    enviarCorrienteBLE();
-    return;
-  }
-  if (cmd.startsWith("SET_MAH_LIM:")) {
-    int lim = cmd.substring(12).toInt();
-    if (lim >= 0 && lim <= 100000) {
-      limiteConsumo_mAh = lim;
-      guardarConfiguracion();
-      if (lim == 0) Serial.println("[CFG] Limite de consumo DESACTIVADO");
-      else Serial.printf("[CFG] Limite de consumo: %d mAh\n", limiteConsumo_mAh);
-      enviarCorrienteBLE();
-    }
-    return;
-  }
-  if (cmd == "CUR" || cmd == "GET_CUR") {
-    imprimirCorriente();
-    enviarCorrienteBLE();
-    return;
-  }
-
-  if (paroEmergencia) {
-    Serial.println("[ERROR] Sistema bloqueado por Emergencia.");
+  // Durante la emergencia solo se bloquean los comandos que mueven el motor.
+  // Consultas y configuración (GET_CFG, STATUS, SET_*, CAL_I0...) siguen
+  // funcionando: la app envía GET_CFG al conectarse.
+  bool esComandoMovimiento = cmd == "START" || cmd.startsWith("DIR:") || cmd.startsWith("SPD:");
+  if (paroEmergencia && esComandoMovimiento) {
+    Serial.println("[ERROR] Paro de emergencia activo. Envia RESET_E para restablecer.");
     return;
   }
 
   if (cmd == "START") {
     enMarcha = true;
+    corrientePico_mA = 0; // El pico se mide por cada marcha
     if (rampTimeMs <= 0) velocidadActual = velocidadObjetivo;
     actualizarSalida();
     Serial.println("[OK] Marcha iniciada.");
@@ -591,20 +512,18 @@ void procesarComando(String cmd) {
     enMarcha = false;
     if (rampTimeMs <= 0) velocidadActual = 0;
     actualizarSalida();
-    guardarConsumo();
     Serial.println("[OK] Detenido.");
   } else if (cmd == "DIR:CW") {
-    sentidoActual = HORARIO;
-    actualizarSalida();
+    cambiarSentido(HORARIO);
   } else if (cmd == "DIR:CCW") {
-    sentidoActual = ANTIHORARIO;
-    actualizarSalida();
+    cambiarSentido(ANTIHORARIO);
   } else if (cmd.startsWith("SPD:")) {
     int valor = cmd.substring(4).toInt();
+    if (valor > velocidadObjetivo) inicioMovimiento = millis(); // Acelerar también genera un pico
     velocidadObjetivo = constrain(valor, speedMin, speedMax);
     if (rampTimeMs <= 0 && enMarcha) velocidadActual = velocidadObjetivo;
     actualizarSalida();
-  } 
+  }
 
   // COMANDOS DE CONFIGURACIÓN DINÁMICA
   else if (cmd.startsWith("SET_FREQ:")) {
@@ -650,56 +569,50 @@ void procesarComando(String cmd) {
   }
 
   // COMANDOS DE CORRIENTE
-  else if (cmd == "CAL_I0") {
-    if (enMarcha || velocidadActual > 0) {
-      Serial.println("[ERROR] Detén el motor (STOP) antes de calibrar el cero.");
-    } else {
-      calibrarCeroCorriente();
-    }
-  } else if (cmd == "CUR_MODE:SENSOR" || cmd == "CUR_MODE:EST") {
-    modoSensorCorriente = (cmd == "CUR_MODE:SENSOR");
-    corrienteFiltrada_mA = 0;
-    guardarConfiguracion();
-    Serial.printf("[CFG] Modo de corriente: %s\n", modoSensorCorriente ? "SENSOR (IS)" : "ESTIMADO (PWM)");
-  } else if (cmd.startsWith("SET_KILIS:")) {
-    float k = cmd.substring(10).toFloat();
-    if (k >= 1000 && k <= 20000) {
-      kILIS = k;
-      guardarConfiguracion();
-      Serial.printf("[CFG] kILIS = %.0f\n", kILIS);
-    } else {
-      Serial.println("[ERROR] kILIS valido entre 1000 y 20000 (tipico 8500)");
-    }
-  } else if (cmd.startsWith("SET_RIS:")) {
-    float r = cmd.substring(8).toFloat();
-    if (r >= 100 && r <= 100000) {
-      resistenciaIS = r;
-      guardarConfiguracion();
-      Serial.printf("[CFG] R_IS = %.0f ohm\n", resistenciaIS);
-    } else {
-      Serial.println("[ERROR] R_IS valida entre 100 y 100000 ohm");
-    }
-  } else if (cmd.startsWith("SET_INOM:")) {
+  else if (cmd.startsWith("SET_ILIM:")) {
     int i = cmd.substring(9).toInt();
-    if (i > 0 && i <= 60000) {
-      corrienteNominal_mA = i;
-      guardarConfiguracion();
-      Serial.printf("[CFG] Corriente nominal (modo estimado) = %d mA\n", corrienteNominal_mA);
-    }
-  } else if (cmd.startsWith("SET_ILIM:")) {
-    int i = cmd.substring(9).toInt();
-    if (i >= 0 && i <= 60000) {
+    if (i >= 0 && i <= 43000) {
       limiteCorriente_mA = i;
       guardarConfiguracion();
-      if (i == 0) Serial.println("[CFG] Proteccion de sobrecorriente DESACTIVADA");
-      else Serial.printf("[CFG] Proteccion de sobrecorriente: %d mA\n", limiteCorriente_mA);
+      if (i == 0) Serial.println("[CFG] Limite de corriente DESACTIVADO");
+      else Serial.printf("[CFG] Limite de corriente: %d mA\n", limiteCorriente_mA);
+      enviarCorrienteBLE();
+    }
+  } else if (cmd.startsWith("SET_TLIM:")) {
+    int t = cmd.substring(9).toInt();
+    if (t >= 0 && t <= 5000) {
+      tiempoLimiteMs = t;
+      guardarConfiguracion();
+      Serial.printf("[CFG] Tiempo por encima del limite para detener: %d ms\n", tiempoLimiteMs);
+    }
+  } else if (cmd.startsWith("SET_TBLANK:")) {
+    int t = cmd.substring(11).toInt();
+    if (t >= 0 && t <= 10000) {
+      tiempoBlankingMs = t;
+      guardarConfiguracion();
+      Serial.printf("[CFG] Tiempo ignorado tras arrancar: %d ms\n", tiempoBlankingMs);
+    }
+  } else if (cmd == "CUR" || cmd == "GET_CUR") {
+    imprimirCorriente();
+    enviarCorrienteBLE();
+  } else if (cmd == "CAL_I0") {
+    if (enMarcha || velocidadActual > 0) {
+      Serial.println("[ERROR] Deten el motor (STOP) antes de calibrar el offset.");
+    } else {
+      calibrarOffset();
+      actualizarSalida();
     }
   } else if (cmd == "CUR_LOG:1" || cmd == "CUR_LOG:0") {
     logCorrienteSerie = (cmd == "CUR_LOG:1");
-  } else if (cmd == "GET_CFG") {
+  }
+
+  else if (cmd == "GET_CFG") {
     enviarConfiguracionBLE();
+    enviarCorrienteBLE();
   } else if (cmd == "STATUS") {
     imprimirEstado();
+  } else {
+    Serial.printf("[ERROR] Comando desconocido: %s\n", cmd.c_str());
   }
 }
 
@@ -710,6 +623,6 @@ void imprimirEstado() {
   else                Serial.print("DETENIDO");
   Serial.print("] | Sentido: ");
   Serial.print(sentidoActual == HORARIO ? "CW" : "CCW");
-  Serial.printf(" | Objetivo: %d | Real PWM: %d | Freq: %d Hz | Corriente: %.2f A ---\n",
-                velocidadObjetivo, velocidadActual, pwmFreq, corrienteFiltrada_mA / 1000.0);
+  Serial.printf(" | Objetivo: %d | Real PWM: %d | Freq: %d Hz | Corriente: %.2f A | Limite: %.2f A ---\n",
+                velocidadObjetivo, velocidadActual, pwmFreq, corriente_mA / 1000.0f, limiteCorriente_mA / 1000.0f);
 }

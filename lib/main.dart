@@ -62,10 +62,8 @@ class _MotorDashboardState extends State<MotorDashboard> {
   // Consumo de corriente (mensajes CUR: de la ESP32)
   double corrienteMa = 0;
   double picoMa = 0;
-  double consumoMah = 0;
-  int limiteMah = 750;
-  bool corrienteEstimada = false;
-  bool bloqueoConsumo = false;
+  int limiteCorrienteMa = 1050;
+  String ladoActivo = '-';
   bool hayDatosCorriente = false;
   final List<FlSpot> historialCorriente = [];
   final Stopwatch relojGrafica = Stopwatch();
@@ -291,7 +289,7 @@ class _MotorDashboardState extends State<MotorDashboard> {
         });
       }
     }
-    // 3. Corriente: CUR:<mA>,<mA pico>,<mAh>,<S|E>[,<límite mAh>,<bloqueado 0|1>]
+    // 3. Corriente: CUR:<mA actual>,<mA pico>,<lado R|L|->,<límite mA>
     else if (raw.startsWith("CUR:")) {
       var c = raw.substring(4).split(",");
       if (c.length >= 4) {
@@ -301,12 +299,8 @@ class _MotorDashboardState extends State<MotorDashboard> {
           hayDatosCorriente = true;
           corrienteMa = double.tryParse(c[0]) ?? corrienteMa;
           picoMa = double.tryParse(c[1]) ?? picoMa;
-          consumoMah = double.tryParse(c[2]) ?? consumoMah;
-          corrienteEstimada = c[3] == "E";
-          if (c.length >= 6) {
-            limiteMah = int.tryParse(c[4]) ?? limiteMah;
-            bloqueoConsumo = c[5] == "1";
-          }
+          ladoActivo = c[2];
+          limiteCorrienteMa = int.tryParse(c[3]) ?? limiteCorrienteMa;
           historialCorriente.add(FlSpot(t, corrienteMa / 1000.0));
           // Conservar solo la ventana visible de la gráfica
           while (historialCorriente.isNotEmpty && historialCorriente.first.x < t - ventanaGraficaSeg - 1) {
@@ -317,71 +311,43 @@ class _MotorDashboardState extends State<MotorDashboard> {
     }
     // 4. Alertas de protección
     else if (raw.startsWith("ALERT:")) {
-      final tipo = raw.substring(6);
-      if (tipo == "MAH_LIMIT") {
-        setState(() => bloqueoConsumo = true);
-        mostrarAlertaBloqueo();
-      } else if (tipo == "OVERCURRENT") {
-        mostrarMensaje('⚠️ Paro por SOBRECORRIENTE');
-      } else if (tipo == "LOCKED") {
-        mostrarMensaje('Motor bloqueado por consumo: reinicia el contador para desbloquear');
-      }
+      if (raw.substring(6) == "GRIP") mostrarAlertaLimite();
     }
   }
 
-  void mostrarAlertaBloqueo() {
+  void mostrarAlertaLimite() {
     if (!mounted) return;
+    final sentidoSoltar = isCw ? 'CCW' : 'CW';
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        icon: const Icon(Icons.lock, color: Colors.redAccent, size: 40),
-        title: const Text('Límite de consumo alcanzado'),
+        icon: const Icon(Icons.pan_tool, color: Colors.amberAccent, size: 40),
+        title: const Text('Límite de corriente alcanzado'),
         content: Text(
-          'Se consumieron ${consumoMah.toStringAsFixed(1)} mAh '
-          '(límite $limiteMah mAh).\n\n'
-          'Se activó el paro de emergencia y el motor quedó bloqueado.',
+          'La corriente superó ${ConsumoCard.amperes(limiteCorrienteMa)} '
+          '(pico ${ConsumoCard.amperes(picoMa)}): el motor se detuvo con paro de emergencia.',
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Entendido')),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              enviarComando('RESET_E');
+            },
+            child: const Text('Restablecer'),
+          ),
+          FilledButton.icon(
+            icon: const Icon(Icons.open_with),
+            onPressed: () async {
+              Navigator.pop(context);
+              await enviarComando('RESET_E');
+              await enviarComando('DIR:$sentidoSoltar');
+              await enviarComando('START');
+            },
+            label: const Text('Soltar'),
+          ),
         ],
       ),
     );
-  }
-
-  Future<void> confirmarDesbloqueo() async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('¿Desbloquear el motor?'),
-        content: const Text(
-          'Se pondrá a cero el contador de consumo (mAh) y se restablecerá '
-          'el paro de emergencia. El motor no arrancará hasta que pulses MARCHA.',
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancelar')),
-          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Desbloquear')),
-        ],
-      ),
-    );
-    if (ok == true) {
-      await enviarComando('CUR_RESET');
-      await enviarComando('RESET_E');
-    }
-  }
-
-  Future<void> confirmarReinicioContador() async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('¿Reiniciar el contador?'),
-        content: const Text('El consumo acumulado (mAh) y el pico de corriente volverán a cero.'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancelar')),
-          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Reiniciar')),
-        ],
-      ),
-    );
-    if (ok == true) await enviarComando('CUR_RESET');
   }
 
   Future<void> enviarComando(String comando) async {
@@ -399,7 +365,7 @@ class _MotorDashboardState extends State<MotorDashboard> {
     final minSpdCtrl = TextEditingController(text: currentMinSpeed.toString());
     final maxSpdCtrl = TextEditingController(text: currentMaxSpeed.toString());
     final rampCtrl = TextEditingController(text: currentRampMs.toString());
-    final mahLimCtrl = TextEditingController(text: limiteMah.toString());
+    final limiteCtrl = TextEditingController(text: (limiteCorrienteMa / 1000).toStringAsFixed(2));
     bool tempInvert = isInverted;
 
     showModalBottomSheet(
@@ -507,15 +473,15 @@ class _MotorDashboardState extends State<MotorDashboard> {
 
                     const SizedBox(height: 12),
 
-                    // Límite de consumo acumulado
+                    // Límite de corriente
                     TextField(
-                      controller: mahLimCtrl,
-                      keyboardType: TextInputType.number,
+                      controller: limiteCtrl,
+                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
                       decoration: const InputDecoration(
-                        labelText: 'Límite de consumo (mAh)',
-                        helperText: 'Al alcanzarlo se bloquea el motor (0 = sin límite)',
+                        labelText: 'Límite de corriente (A)',
+                        helperText: 'Al superarlo el motor se detiene (0 = desactivado)',
                         border: OutlineInputBorder(),
-                        prefixIcon: Icon(Icons.battery_alert),
+                        prefixIcon: Icon(Icons.pan_tool),
                       ),
                     ),
 
@@ -542,8 +508,10 @@ class _MotorDashboardState extends State<MotorDashboard> {
                           if (sMin != null && sMax != null) enviarComando('SET_LIMITS:$sMin,$sMax');
                           if (r != null) enviarComando('SET_RAMP:$r');
                           enviarComando('SET_INVERT:${tempInvert ? 1 : 0}');
-                          int? mahLim = int.tryParse(mahLimCtrl.text);
-                          if (mahLim != null && mahLim >= 0) enviarComando('SET_MAH_LIM:$mahLim');
+                          double? limiteA = double.tryParse(limiteCtrl.text.replaceAll(',', '.'));
+                          if (limiteA != null && limiteA >= 0) {
+                            enviarComando('SET_ILIM:${(limiteA * 1000).round()}');
+                          }
 
                           Navigator.pop(context);
                           ScaffoldMessenger.of(context).showSnackBar(
@@ -629,7 +597,7 @@ class _MotorDashboardState extends State<MotorDashboard> {
                 onPressed: () => enviarComando('E'),
               ),
             ),
-            if (isEmergency && !bloqueoConsumo)
+            if (isEmergency)
               Padding(
                 padding: const EdgeInsets.only(top: 8.0),
                 child: TextButton.icon(
@@ -766,13 +734,9 @@ class _MotorDashboardState extends State<MotorDashboard> {
               ConsumoCard(
                 corrienteMa: corrienteMa,
                 picoMa: picoMa,
-                consumoMah: consumoMah,
-                limiteMah: limiteMah,
-                esEstimada: corrienteEstimada,
-                bloqueado: bloqueoConsumo,
+                limiteMa: limiteCorrienteMa,
+                lado: ladoActivo,
                 historial: List.unmodifiable(historialCorriente),
-                onDesbloquear: isConnected ? confirmarDesbloqueo : null,
-                onReiniciarContador: isConnected ? confirmarReinicioContador : null,
               )
             else
               const Card(

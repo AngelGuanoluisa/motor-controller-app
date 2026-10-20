@@ -12,6 +12,7 @@ motor-controller-app/
 ├── .github/workflows/build_apk.yml   # Compila el APK automáticamente en GitHub Actions
 ├── android/                          # Proyecto Android nativo (Gradle, permisos BLE, MainActivity)
 ├── lib/main.dart                     # Código de la aplicación
+├── lib/consumo_card.dart             # Tarjeta y gráfica de corriente
 ├── test/widget_test.dart             # Prueba básica de la interfaz
 ├── esp32_firmware/esp32_firmware.ino # Firmware C++ para la ESP32 (Arduino IDE / PlatformIO)
 └── pubspec.yaml                      # Dependencias Flutter
@@ -37,13 +38,15 @@ Cada push a `main`/`master` compila el APK en GitHub Actions:
 
 | Pin BTS7960 | Pin ESP32 | Descripción |
 | :--- | :--- | :--- |
-| **VCC** | 5V / VIN | Alimentación de la lógica del BTS7960 |
-| **GND** | GND | Tierra compartida (¡común con fuente del motor!) |
-| **R_EN** | GPIO 25 | Habilitar giro horario |
-| **L_EN** | GPIO 26 | Habilitar giro antihorario |
-| **RPWM** | GPIO 32 | Señal PWM giro horario (Right PWM) |
-| **LPWM** | GPIO 33 | Señal PWM giro antihorario (Left PWM) |
-| **B+ / B-** | Fuente Externa | Alimentación del motor (12V / 24V) |
+| **VCC** | 3V3 | Alimentación de la lógica del módulo |
+| **GND** | GND | Tierra compartida (**¡común con la fuente del motor!**) |
+| **RPWM** | GPIO 25 | PWM giro adelante (CW) |
+| **LPWM** | GPIO 26 | PWM giro atrás (CCW) |
+| **R_EN** | GPIO 27 | Habilitar lado R |
+| **L_EN** | GPIO 14 | Habilitar lado L |
+| **R_IS** | GPIO 34 | Sensado de corriente lado R (ADC1, solo entrada) |
+| **L_IS** | GPIO 35 | Sensado de corriente lado L (ADC1, solo entrada) |
+| **B+ / B-** | Fuente Externa | Alimentación del motor |
 | **M+ / M-** | Motor DC | Bornes del motor |
 
 ---
@@ -63,93 +66,57 @@ Cada push a `main`/`master` compila el APK en GitHub Actions:
 
 ---
 
-## 🔋 Medición de corriente (prueba adicional)
+## 🔋 Medición de corriente y límite
 
-El BTS7960 tiene pines de sensado **R_IS** y **L_IS** que entregan una corriente
-proporcional a la del motor (`I_IS = I_motor / 8500`). Con una resistencia a GND
-esa corriente se convierte en tensión, que la ESP32 lee con su ADC.
-
-### Conexión
-
-| Pin BTS7960 | Conexión |
-| :--- | :--- |
-| **R_IS** | Resistencia **680 Ω** a GND, y de ahí a **GPIO 34** (opcional: 1 kΩ en serie hacia el GPIO) |
-| **L_IS** | Resistencia **680 Ω** a GND, y de ahí a **GPIO 35** (opcional: 1 kΩ en serie hacia el GPIO) |
+La corriente se mide con las salidas **R_IS / L_IS** del BTS7960 (el IBT-2 trae
+1 kΩ en cada pin IS):
 
 ```text
- R_IS ──┬──[1k opcional]── GPIO 34        L_IS ──┬──[1k opcional]── GPIO 35
-        │                                        │
-      [680Ω]                                   [680Ω]
-        │                                        │
-       GND                                      GND
+I_motor = (V_IS / R_IS) × K_ILIS
 ```
 
-> ⚠️ **No uses 1 kΩ o más a GND**: ante un fallo el BTS7960 saca ~4.5 mA por IS
-> y con 1 kΩ serían 4.5 V, suficiente para dañar el pin de la ESP32. Con 680 Ω
-> el máximo es ~3.06 V. Si usas otro valor, configúralo con `SET_RIS:<ohm>`.
-> Si tu módulo ya trae resistencia en IS, mídela con el multímetro (sin
-> alimentar) y tenla en cuenta: dos resistencias quedan en paralelo.
+El módulo tiene **dos chips** (uno por lado) y cada uno está calibrado por
+separado. Solo mide el chip del lado que está conduciendo:
 
-### Primer uso (por Monitor Serie o BLE)
+| Sentido | Pin | Constante calibrada |
+| :--- | :--- | :--- |
+| Adelante (RPWM) | R_IS → GPIO 34 | `K_ILIS_R = 566.0` |
+| Atrás (LPWM) | L_IS → GPIO 35 | `K_ILIS_L = 793.5` |
 
-1. Con el motor **detenido**, envía `CAL_I0` para calibrar el cero.
-2. Arranca el motor (`START`, `SPD:200`). Cada segundo verás:
-   `[CORRIENTE MEDIDA] Promedio: 1.85 A | Pico: 2.40 A | Consumido: 0.3 mAh | PWM: 200`
-3. Compara con un multímetro/pinza en serie con la fuente. Si hay diferencia
-   constante, ajusta el factor con `SET_KILIS:<valor>` (más alto = lee más corriente).
-   Ej.: lee 1.85 A y el multímetro marca 2.00 A → `SET_KILIS:9189` (8500 × 2.00 / 1.85).
+Cada lectura promedia 32 muestras del ADC. El offset de cada pin se calibra
+automáticamente al encender, con el motor detenido (`CAL_I0` lo repite).
 
-### Sin sensor: modo estimado
+### Límite de corriente (1.05 A)
 
-Si no conectas R_IS/L_IS, usa `CUR_MODE:EST`. La corriente se estima como
-`I_nominal × PWM/255`. Mide una vez con el multímetro la corriente a PWM 255
-con la carga habitual y guárdala con `SET_INOM:<mA>` (ej. `SET_INOM:2500`).
-Es solo una aproximación: no detecta atascos ni cambios de carga.
+Si la corriente supera **1.05 A** durante **150 ms** seguidos, se activa el
+**paro de emergencia** y el motor se detiene. Se ignoran los primeros
+**500 ms** tras arrancar, cambiar de sentido o acelerar, porque el arranque
+siempre pide un pico de corriente.
 
-### 🔒 Límite de consumo (750 mAh) con bloqueo
-
-La ESP32 acumula la carga consumida (mAh). Cuando llega al límite
-(**750 mAh** por defecto):
-
-1. Activa el **paro de emergencia** y el motor queda **bloqueado**.
-2. `RESET_E` **no** lo libera, ni siquiera tras reiniciar o apagar la ESP32
-   (el consumo y el bloqueo se guardan en flash).
-3. Para desbloquear: `CUR_RESET` (pone el contador a cero) y luego `RESET_E`.
-   En la app basta con el botón **"Reiniciar contador y desbloquear"**.
-
-> **mAh ≠ mA.** 750 mAh es carga acumulada: p. ej. 750 mA durante 1 hora,
-> 1.5 A durante 30 min o 3 A durante 15 min. Para cortar por corriente
-> instantánea usa `SET_ILIM:<mA>`.
-
-El límite se cambia con `SET_MAH_LIM:<mAh>` (0 = sin límite) o desde los
-ajustes ⚙️ de la app.
+- El límite se cambia con `SET_ILIM:<mA>` (ej. `SET_ILIM:1050`) o desde los
+  ajustes ⚙️ de la app (en amperios). `0` lo desactiva.
+- Para continuar: `RESET_E`, cambiar de sentido y `START`. En la app, el aviso
+  tiene un botón **Soltar** que lo hace.
 
 ### Comandos de corriente
 
 | Comando | Función |
 | :--- | :--- |
-| `CUR` | Muestra la corriente actual |
-| `CUR_RESET` | Reinicia el pico y los mAh acumulados, y libera el bloqueo por consumo |
-| `SET_MAH_LIM:<mAh>` | Límite de consumo acumulado (por defecto 750, 0 = sin límite) |
-| `CAL_I0` | Calibra el cero (con el motor detenido) |
-| `CUR_MODE:SENSOR` / `CUR_MODE:EST` | Medición real por IS / estimación por PWM |
-| `SET_RIS:<ohm>` | Resistencia de IS a GND (por defecto 680) |
-| `SET_KILIS:<k>` | Factor de sensado del BTS7960 (por defecto 8500) |
-| `SET_INOM:<mA>` | Corriente a PWM 255 para el modo estimado |
-| `SET_ILIM:<mA>` | Paro de emergencia automático si se supera durante 300 ms (0 = desactivado) |
+| `CUR` | Muestra la corriente actual (mV y A de cada lado) |
+| `SET_ILIM:<mA>` | Límite de corriente (por defecto 1050, 0 = desactivado) |
+| `SET_TLIM:<ms>` | Tiempo por encima del límite para detener (por defecto 150) |
+| `SET_TBLANK:<ms>` | Tiempo ignorado tras arrancar / cambiar de sentido (por defecto 500) |
+| `CAL_I0` | Recalibra el offset (con el motor detenido) |
 | `CUR_LOG:1` / `CUR_LOG:0` | Activa/desactiva el registro cada segundo en el Monitor Serie |
 
-Todos los valores se guardan en la memoria flash. Por BLE la ESP32 envía cada
-250 ms `CUR:<mA promedio>,<mA pico>,<mAh>,<S|E>,<límite mAh>,<bloqueado 0|1>`
-y, si actúa una protección, `ALERT:OVERCURRENT`, `ALERT:MAH_LIMIT` o
-`ALERT:LOCKED`.
+Por BLE la ESP32 envía cada 250 ms `CUR:<mA actual>,<mA pico>,<lado R|L|->,<límite mA>`
+y, cuando actúa el límite, `ALERT:GRIP`.
 
 ### 📈 En la app
 
-La tarjeta **Consumo de Corriente** muestra la corriente actual y el pico, una
-barra del consumo acumulado frente al límite (verde → naranja al 80 % → rojo)
-y una **gráfica de la corriente de los últimos 60 s**. Si se alcanza el límite,
-aparece un aviso y el botón para desbloquear.
+La tarjeta **Consumo de Corriente** muestra la corriente actual, el pico de la
+marcha, qué lado está midiendo y una **gráfica de los últimos 60 s** con una
+línea roja en el límite.
 
 ---
 

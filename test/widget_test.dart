@@ -3,6 +3,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:motor_controller/main.dart';
 
+Future<dynamic> iniciarApp(WidgetTester tester) async {
+  tester.view.physicalSize = const Size(1080, 6000);
+  tester.view.devicePixelRatio = 2.625;
+  addTearDown(tester.view.reset);
+  await tester.pumpWidget(const MotorControllerApp());
+  return tester.state(find.byType(MotorDashboard));
+}
+
 void main() {
   testWidgets('Muestra el panel de control desconectado', (WidgetTester tester) async {
     await tester.pumpWidget(const MotorControllerApp());
@@ -13,43 +21,38 @@ void main() {
     expect(find.text('Conéctate a la ESP32 para ver la gráfica'), findsOneWidget);
   });
 
-  testWidgets('Los mensajes CUR muestran corriente, consumo y gráfica', (WidgetTester tester) async {
-    tester.view.physicalSize = const Size(1080, 6000);
-    tester.view.devicePixelRatio = 2.625;
-    addTearDown(tester.view.reset);
-    await tester.pumpWidget(const MotorControllerApp());
-    final dynamic estado = tester.state(find.byType(MotorDashboard));
+  testWidgets('Los mensajes CUR muestran corriente, pico, lado y gráfica', (WidgetTester tester) async {
+    final dynamic estado = await iniciarApp(tester);
 
-    estado.procesarDatosEntrantes('CUR:1500,2100,123.4,S,750,0');
-    estado.procesarDatosEntrantes('CUR:1600,2100,123.5,S,750,0');
+    estado.procesarDatosEntrantes('CUR:640,720,R,1050');
+    estado.procesarDatosEntrantes('CUR:655,720,R,1050');
     await tester.pump();
 
-    expect(find.text('1.60 A'), findsOneWidget);
-    expect(find.text('Pico: 2.10 A'), findsOneWidget);
-    expect(find.text('123.5 / 750 mAh'), findsOneWidget);
+    expect(find.text('0.66 A'), findsOneWidget);
+    expect(find.text('Pico: 0.72 A'), findsOneWidget);
+    expect(find.text('Lado R (adelante)'), findsOneWidget);
+    expect(find.text('Se detiene al superar 1.05 A'), findsOneWidget);
     expect(find.byType(LineChart), findsOneWidget);
-    expect(find.textContaining('BLOQUEADO'), findsNothing);
+    expect(find.textContaining('mAh'), findsNothing);
   });
 
-  testWidgets('Al llegar al límite de mAh se muestra el bloqueo', (WidgetTester tester) async {
-    tester.view.physicalSize = const Size(1080, 6000);
-    tester.view.devicePixelRatio = 2.625;
-    addTearDown(tester.view.reset);
-    await tester.pumpWidget(const MotorControllerApp());
-    final dynamic estado = tester.state(find.byType(MotorDashboard));
+  testWidgets('Al superar el límite se avisa y se puede soltar', (WidgetTester tester) async {
+    final dynamic estado = await iniciarApp(tester);
 
     estado.procesarDatosEntrantes('ST:EMG,CW,150,0');
-    estado.procesarDatosEntrantes('CUR:0,2100,750.0,S,750,1');
-    estado.procesarDatosEntrantes('ALERT:MAH_LIMIT');
+    estado.procesarDatosEntrantes('CUR:0,1120,-,1050');
+    estado.procesarDatosEntrantes('ALERT:GRIP');
     await tester.pumpAndSettle();
 
-    expect(find.text('Límite de consumo alcanzado'), findsOneWidget);
-    await tester.tap(find.text('Entendido'));
-    await tester.pumpAndSettle();
+    expect(find.text('Límite de corriente alcanzado'), findsOneWidget);
+    expect(find.textContaining('1.05 A'), findsWidgets);
+    expect(find.textContaining('pico 1.12 A'), findsOneWidget);
+    expect(find.text('Soltar'), findsOneWidget);
 
-    expect(find.text('Motor BLOQUEADO: se alcanzó el límite de consumo'), findsOneWidget);
-    expect(find.text('Reiniciar contador y desbloquear'), findsOneWidget);
-    // RESET_E no sirve mientras está bloqueado: el botón se oculta
-    expect(find.text('Restablecer Emergencia'), findsNothing);
+    await tester.tap(find.text('Restablecer'));
+    await tester.pumpAndSettle();
+    expect(find.text('Límite de corriente alcanzado'), findsNothing);
+    expect(find.text('Motor detenido'), findsOneWidget);
+    expect(find.text('Restablecer Emergencia'), findsOneWidget);
   });
 }
